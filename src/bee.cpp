@@ -1,0 +1,864 @@
+// [[Rcpp::plugins(cpp11)]]
+
+#include <memory>
+#include <string>
+#include <sstream>
+
+#include <Rcpp.h>
+
+#include <bee/bee.h>
+#include <bee/beer_net.h>
+#include <bee/beer_opt.h>
+
+#include <msgpack.hpp>
+
+using TntStream = struct beer_stream;
+using TntReply = struct beer_reply;
+
+class TntStreamDeleter
+{
+public:
+    void operator()(TntStream *s)
+    {
+        beer_stream_free(s);
+    }
+};
+
+class TntReplyDeleter
+{
+public:
+    void operator()(TntReply *r)
+    {
+        beer_reply_free(r);
+        free(r);
+    }
+};
+
+using TntStreamPtr = std::unique_ptr<TntStream, TntStreamDeleter>;
+using TntReplyPtr = std::unique_ptr<TntReply, TntReplyDeleter>;
+using TntStreamRawPtr = TntStream *;
+
+static const std::string kDefaultHost = "localhost";
+static const int kDefaultPort = 3301;
+static const std::string kDefaultUser = "";
+static const std::string kDefaultPassword = "";
+
+// FIXME: implement all operators
+static const std::unordered_set<char> valid_update_operators{ '+', '-', '&', '|', '^', '=', '#', '!' };
+
+class Bee
+{
+public:
+    Bee()
+    {
+        initialize(kDefaultHost, kDefaultPort, kDefaultUser, kDefaultPassword);
+    }
+
+    Bee(std::string host, int port)
+    {
+        initialize(host, port, kDefaultUser, kDefaultPassword);
+    }
+
+    Bee(std::string host, int port, std::string user, std::string password)
+    {
+        initialize(host, port, user, password);
+    }
+
+    SEXP ping()
+    {
+        return (ping_impl());
+    }
+
+    SEXP insert(SEXP space, SEXP tpl)
+    {
+        TntStreamPtr packed_tuple = pack_buffer(tpl);
+
+        return (insert_impl(space, packed_tuple));
+    }
+
+    SEXP replace(SEXP space, SEXP tpl)
+    {
+        TntStreamPtr packed_tuple = pack_buffer(tpl);
+
+        return (replace_impl(space, packed_tuple));
+    }
+
+    SEXP select(SEXP space, SEXP key, const Rcpp::List params)
+    {
+        TntStreamPtr packed_key = pack_buffer(key);
+
+        uint32_t index = 0;
+        uint32_t limit = std::numeric_limits<uint32_t>::max();
+        uint32_t offset = 0;
+        int iterator = BEER_ITER_EQ;
+
+        if (params.containsElementNamed("index")) {
+            index = Rcpp::as<uint32_t>(params["index"]);
+        }
+
+        if (params.containsElementNamed("limit")) {
+            limit = Rcpp::as<uint32_t>(params["limit"]);
+        }
+
+        if (params.containsElementNamed("offset")) {
+            offset = Rcpp::as<uint32_t>(params["offset"]);
+        }
+
+        if (params.containsElementNamed("iterator")) {
+            iterator = Rcpp::as<int>(params["iterator"]);
+        }
+
+        return (select_impl(space, packed_key, index, limit, offset, iterator));
+    }
+
+    SEXP delete_(SEXP space, SEXP key, const Rcpp::List params)
+    {
+        TntStreamPtr packed_key = pack_buffer(key);
+
+        uint32_t index = 0;
+
+        if (params.containsElementNamed("index")) {
+            index = Rcpp::as<uint32_t>(params["index"]);
+        }
+
+        return (delete_impl(space, packed_key, index));
+    }
+
+    SEXP update(SEXP space, SEXP tpl, const Rcpp::List params)
+    {
+        TntStreamPtr packed_tuple = pack_buffer(tpl);
+
+        uint32_t index = 0;
+
+        if (params.containsElementNamed("index")) {
+            index = Rcpp::as<uint32_t>(params["index"]);
+        }
+
+        if (!params.containsElementNamed("ops")) {
+            Rcpp::stop("missed mandatory entry 'ops'");
+        }
+
+        Rcpp::List ops_desc = Rcpp::as<Rcpp::List>(params["ops"]);
+        TntStreamPtr packed_ops = pack_update_ops(ops_desc);
+
+        return (update_impl(space, packed_tuple, index, packed_ops));
+    }
+
+    SEXP upsert(SEXP space, SEXP tpl, const Rcpp::List params)
+    {
+        TntStreamPtr packed_tuple = pack_buffer(tpl);
+
+        if (!params.containsElementNamed("ops")) {
+            Rcpp::stop("missed mandatory entry 'ops'");
+        }
+
+        Rcpp::List ops_desc = Rcpp::as<Rcpp::List>(params["ops"]);
+        TntStreamPtr packed_ops = pack_update_ops(ops_desc);
+
+        return (upsert_impl(space, packed_tuple, packed_ops));
+    }
+
+    SEXP call(const std::string &func, SEXP args)
+    {
+        TntStreamPtr packed_args = pack_buffer(args);
+
+        return (call_impl(func, packed_args));
+    }
+
+    SEXP evaluate(const std::string &lua_statement, SEXP args)
+    {
+        TntStreamPtr packed_args = pack_buffer(args);
+
+        return (evaluate_impl(lua_statement, packed_args));
+    }
+
+private:
+    TntStreamPtr stream;
+    msgpack::sbuffer buff;
+    msgpack::sbuffer update_op_buff;
+
+    void initialize(std::string host, int port, std::string user, std::string password);
+    std::string mk_connect_uri(std::string host, int port, std::string user, std::string password);
+    std::string mk_error_msg(TntStreamPtr &stream);
+    void unpack_msgpack_object(const msgpack::object &obj, Rcpp::List &l);
+    Rcpp::List pack_list(Rcpp::List x, msgpack::packer<msgpack::sbuffer> &pk);
+    void pack_elem(Rcpp::List::iterator &it, msgpack::packer<msgpack::sbuffer> &pk);
+    void unpack_array(const std::vector<msgpack::object> &v, Rcpp::List &l);
+    void unpack_map(const std::map<std::string, msgpack::object> &v, Rcpp::List &l);
+    SEXP read_server_reply();
+    int get_space_id(SEXP space);
+    TntStreamPtr pack_update_ops(const Rcpp::List &ops_desc);
+    TntStreamPtr pack_buffer(SEXP tpl);
+    TntStreamPtr pack_update_arg(SEXP tpl);
+    void check_beer_api_rc(int rc, const char *function_name);
+    std::string sexp_type_name(SEXP x);
+    std::string msgpack_type_name(int type);
+
+    SEXP ping_impl();
+    SEXP insert_impl(SEXP space, TntStreamPtr &tuple);
+    SEXP replace_impl(SEXP space, TntStreamPtr &tuple);
+    SEXP select_impl(SEXP space, TntStreamPtr &key, uint32_t index, uint32_t limit, uint32_t offset, int iterator);
+    SEXP delete_impl(SEXP space, TntStreamPtr &key, uint32_t index);
+    SEXP update_impl(SEXP space, TntStreamPtr &tuple, uint32_t index, TntStreamPtr &ops);
+    SEXP upsert_impl(SEXP space, TntStreamPtr &tuple, TntStreamPtr &ops);
+    SEXP call_impl(const std::string &func, TntStreamPtr &args);
+    SEXP evaluate_impl(const std::string &lua_statement, TntStreamPtr &args);
+};
+
+void Bee::pack_elem(Rcpp::List::iterator &it, msgpack::packer<msgpack::sbuffer> &pk)
+{
+    switch (TYPEOF(*it)) {
+    case VECSXP: {
+        *it = pack_list(*it, pk);
+        break;
+    }
+    case REALSXP: {
+        auto v = Rcpp::as<double>(*it);
+        pk.pack(v);
+        break;
+    }
+    case INTSXP: {
+        if (Rf_isFactor(*it)) { // factors have internal type INTSXP too
+            // FIXME: deal with factors!
+            Rcpp::stop("R's factors not supported yet!");
+        } else {
+            auto v = Rcpp::as<int64_t>(*it);
+            pk.pack(v);
+        }
+        break;
+    }
+    case STRSXP: {
+        auto v = Rcpp::as<std::string>(*it);
+        pk.pack(v);
+        break;
+    }
+    case NILSXP:
+        pk.pack_nil();
+        break;
+    case LGLSXP: {
+        auto v = Rcpp::as<bool>(*it);
+        pk.pack(v);
+        break;
+    }
+    case RAWSXP: {
+        auto v = Rcpp::as<std::vector<uint8_t>>(*it);
+        pk.pack(v);
+        break;
+    }
+    default: {
+        // See https://github.com/wch/r-source/blob/e5b21d0397c607883ff25cca379687b86933d730/src/include/Rinternals.h
+        // for more details about R's internal data types
+        Rcpp::stop("unsupported R's data type: %s", sexp_type_name(*it).c_str());
+    }
+    } // switch
+}
+
+void Bee::unpack_msgpack_object(const msgpack::object &obj, Rcpp::List &l)
+{
+    if (obj.type == msgpack::type::POSITIVE_INTEGER) {
+        l.push_back(obj.as<unsigned long long>());
+    } else if (obj.type == msgpack::type::NEGATIVE_INTEGER) {
+        auto e = -static_cast<int64_t>(std::numeric_limits<unsigned long long>::max() - obj.as<long long>() + 1);
+        l.push_back(e);
+    } else if (obj.type == msgpack::type::FLOAT) {
+        l.push_back(obj.as<double>());
+    } else if (obj.type == msgpack::type::STR) {
+        l.push_back(obj.as<std::string>());
+    } else if (obj.type == msgpack::type::BIN) {
+        // FIXME: treat binaries as lists?
+        l.push_back(obj.as<std::vector<uint8_t>>());
+    } else if (obj.type == msgpack::type::NIL) {
+        l.push_back(R_NilValue);
+    } else if (obj.type == msgpack::type::BOOLEAN) {
+        l.push_back(obj.as<bool>());
+    } else {
+        Rcpp::stop("unsupported msgpack object: %s", msgpack_type_name(obj.type).c_str());
+    }
+}
+
+void Bee::unpack_map(const std::map<std::string, msgpack::object> &m, Rcpp::List &l)
+{
+    std::vector<std::string> keys;
+
+    keys.reserve(m.size());
+    for (const auto &e : m) {
+        keys.push_back(e.first);
+    }
+
+    for (const auto &e : m) {
+        if (e.second.type == msgpack::type::ARRAY) {
+            auto v = e.second.as<std::vector<msgpack::object>>();
+            Rcpp::List sub_l;
+            unpack_array(v, sub_l);
+            l.push_back(sub_l);
+        } else if (e.second.type == msgpack::type::MAP) {
+            auto m = e.second.as<std::map<std::string, msgpack::object>>();
+            Rcpp::List sub_l;
+            unpack_map(m, sub_l);
+            l.push_back(sub_l);
+        } else {
+            unpack_msgpack_object(e.second, l);
+        }
+    }
+
+    l.attr("names") = Rcpp::wrap(keys);
+}
+
+void Bee::unpack_array(const std::vector<msgpack::object> &v, Rcpp::List &l)
+{
+    for (const auto &e : v) {
+        if (e.type == msgpack::type::ARRAY) {
+            auto v = e.as<std::vector<msgpack::object>>();
+            Rcpp::List sub_l;
+            unpack_array(v, sub_l);
+            l.push_back(sub_l);
+        } else if (e.type == msgpack::type::MAP) {
+            auto m = e.as<std::map<std::string, msgpack::object>>();
+            Rcpp::List sub_l;
+            unpack_map(m, sub_l);
+            l.push_back(sub_l);
+        } else {
+            unpack_msgpack_object(e, l);
+        }
+    }
+}
+
+Rcpp::List Bee::pack_list(Rcpp::List x, msgpack::packer<msgpack::sbuffer> &pk)
+{
+    pk.pack_array(x.size());
+
+    for (Rcpp::List::iterator it = x.begin(); it != x.end(); ++it) {
+        pack_elem(it, pk);
+    }
+
+    return (x);
+}
+
+std::string Bee::mk_error_msg(TntStreamPtr &stream)
+{
+    std::string msg = std::string("bee: ") + std::string(beer_strerror(stream.get()));
+    return (msg);
+}
+
+void Bee::initialize(std::string host, int port, std::string user, std::string password)
+{
+    stream = TntStreamPtr(beer_net(nullptr));
+    auto uri = mk_connect_uri(host, port, user, password);
+
+    {
+        auto err = beer_error(stream.get());
+        if (err != BEER_EOK) {
+            Rcpp::stop(mk_error_msg(stream));
+        }
+    }
+
+    {
+        auto err = beer_set(stream.get(), BEER_OPT_URI, uri.c_str());
+        if (err != BEER_EOK) {
+            Rcpp::stop(mk_error_msg(stream));
+        }
+
+        beer_set(stream.get(), BEER_OPT_SEND_BUF, 0);
+        beer_set(stream.get(), BEER_OPT_RECV_BUF, 0);
+
+        err = beer_connect(stream.get());
+        if (err != BEER_EOK) {
+            Rcpp::stop(mk_error_msg(stream));
+        }
+
+        err = beer_reload_schema(stream.get());
+        if (err != BEER_EOK) {
+            Rcpp::stop(mk_error_msg(stream));
+        }
+    }
+}
+
+SEXP Bee::ping_impl()
+{
+    SEXP result = Rcpp::wrap(false);
+
+    auto rc = beer_ping(stream.get());
+    if (rc == -1) {
+        Rcpp::stop(mk_error_msg(stream));
+    }
+
+    auto reply = TntReplyPtr(beer_reply_init(NULL));
+    if (!reply) {
+        Rcpp::stop(mk_error_msg(stream));
+    }
+
+    rc = stream->read_reply(stream.get(), reply.get());
+    if (rc == -1) {
+        Rcpp::stop("bee: ping failed");
+    }
+    if (reply->code == 0) {
+        result = Rcpp::wrap(true);
+    } else {
+        std::string error_msg;
+        if (reply->error && reply->error_end) {
+            error_msg = std::string(reply->error, reply->error_end - reply->error);
+        } else {
+            error_msg = "ping failed";
+        }
+        Rcpp::stop(error_msg);
+    }
+
+    return result;
+}
+
+SEXP Bee::insert_impl(SEXP space, TntStreamPtr &tuple)
+{
+    auto space_id = get_space_id(space);
+    auto rc = beer_insert(stream.get(), space_id, tuple.get());
+    check_beer_api_rc(rc, "beer_insert()");
+
+    rc = beer_flush(stream.get());
+    check_beer_api_rc(rc, "beer_flush()");
+
+    auto result = read_server_reply();
+
+    return (result);
+}
+
+SEXP Bee::replace_impl(SEXP space, TntStreamPtr &tuple)
+{
+    auto space_id = get_space_id(space);
+    auto rc = beer_replace(stream.get(), space_id, tuple.get());
+    check_beer_api_rc(rc, "beer_replace()");
+
+    rc = beer_flush(stream.get());
+    check_beer_api_rc(rc, "beer_flush()");
+
+    auto result = read_server_reply();
+
+    return (result);
+}
+
+SEXP Bee::select_impl(SEXP space, TntStreamPtr &key, uint32_t index, uint32_t limit, uint32_t offset, int iterator)
+{
+    auto space_id = get_space_id(space);
+    auto rc = beer_select(stream.get(), space_id, index, limit, offset, iterator, key.get());
+    check_beer_api_rc(rc, "beer_select()");
+
+    rc = beer_flush(stream.get());
+    check_beer_api_rc(rc, "beer_flush()");
+
+    auto result = read_server_reply();
+
+    return (result);
+}
+
+SEXP Bee::delete_impl(SEXP space, TntStreamPtr &key, uint32_t index)
+{
+    auto space_id = get_space_id(space);
+    auto rc = beer_delete(stream.get(), space_id, index, key.get());
+    check_beer_api_rc(rc, "beer_delete()");
+
+    rc = beer_flush(stream.get());
+    check_beer_api_rc(rc, "beer_flush()");
+
+    auto result = read_server_reply();
+
+    return (result);
+}
+
+SEXP Bee::update_impl(SEXP space, TntStreamPtr &tuple, uint32_t index, TntStreamPtr &ops)
+{
+    auto space_id = get_space_id(space);
+    auto rc = beer_update(stream.get(), space_id, index, tuple.get(), ops.get());
+    check_beer_api_rc(rc, "beer_update()");
+
+    rc = beer_flush(stream.get());
+    check_beer_api_rc(rc, "beer_flush()");
+
+    auto result = read_server_reply();
+
+    return (result);
+}
+
+SEXP Bee::upsert_impl(SEXP space, TntStreamPtr &tuple, TntStreamPtr &ops)
+{
+    auto space_id = get_space_id(space);
+    auto rc = beer_upsert(stream.get(), space_id, tuple.get(), ops.get());
+    check_beer_api_rc(rc, "beer_upsert()");
+
+    rc = beer_flush(stream.get());
+    check_beer_api_rc(rc, "beer_flush()");
+
+    auto result = read_server_reply();
+
+    return (result);
+}
+
+SEXP Bee::call_impl(const std::string &func, TntStreamPtr &args)
+{
+    auto rc = beer_call(stream.get(), func.c_str(), func.size(), args.get());
+    check_beer_api_rc(rc, "beer_call()");
+
+    rc = beer_flush(stream.get());
+    check_beer_api_rc(rc, "beer_flush()");
+
+    auto result = read_server_reply();
+
+    return (result);
+}
+
+SEXP Bee::evaluate_impl(const std::string &lua_statement, TntStreamPtr &args)
+{
+    auto rc = beer_eval(stream.get(), lua_statement.c_str(), lua_statement.size(), args.get());
+    check_beer_api_rc(rc, "beer_eval()");
+
+    rc = beer_flush(stream.get());
+    check_beer_api_rc(rc, "beer_flush()");
+
+    auto result = read_server_reply();
+
+    return (result);
+}
+
+std::string Bee::mk_connect_uri(std::string host, int port, std::string user, std::string password)
+{
+    std::stringstream ss;
+
+    if (!user.empty()) {
+        ss << user;
+    }
+
+    if (!password.empty()) {
+        ss << ":" << password;
+    }
+
+    if (!ss.str().empty()) {
+        ss << "@";
+    }
+
+    if (!host.empty() && port > 0) {
+        ss << host << ":" << port;
+    }
+
+    return ss.str();
+}
+
+SEXP Bee::read_server_reply()
+{
+    SEXP result = R_NilValue;
+
+    auto reply = TntReplyPtr(beer_reply_init(NULL));
+    if (!reply) {
+        Rcpp::stop("couldn't init beer_reply object");
+    }
+
+    auto rc = stream->read_reply(stream.get(), reply.get());
+    if (rc == -1) {
+        // FIXME: need to get meaningful error message.
+        Rcpp::stop("read_reply() failed");
+    }
+    if (reply->code != 0) {
+        std::string err_msg;
+        if (reply->error && reply->error_end) {
+            err_msg = std::string(reply->error, reply->error_end - reply->error);
+        }
+        Rcpp::stop(err_msg);
+    } else {
+        if (reply->data && reply->data_end) {
+            msgpack::unpacked unpacked;
+            msgpack::unpack(unpacked, reply->data, reply->data_end - reply->data);
+            msgpack::object obj(unpacked.get());
+
+            auto v = obj.as<std::vector<msgpack::object>>();
+            Rcpp::List l;
+            unpack_array(v, l);
+
+            result = Rcpp::wrap(l);
+        }
+    }
+
+    return result;
+}
+
+int Bee::get_space_id(SEXP space)
+{
+    int space_id = -1;
+
+    auto t = TYPEOF(space);
+    if (t == STRSXP) {
+        auto s = Rcpp::as<std::string>(space);
+        space_id = beer_get_spaceno(stream.get(), s.c_str(), s.size());
+        if (space_id == -1) {
+            Rcpp::stop("space '%s' doesn't exist.", s.c_str());
+        }
+    } else if (t == INTSXP || t == REALSXP) {
+        space_id = Rcpp::as<int>(space);
+    } else {
+        Rcpp::stop("space must be an integer or a string");
+    }
+
+    return space_id;
+}
+
+TntStreamPtr Bee::pack_update_ops(const Rcpp::List &x)
+{
+    int rc;
+    TntStreamPtr ops = TntStreamPtr(beer_update_container(NULL));
+
+    for (const auto &v : x) {
+        if (TYPEOF(v) != VECSXP) {
+            Rcpp::stop("invalid structure of update operation description.");
+        }
+
+        auto single_op = Rcpp::as<Rcpp::List>(v);
+
+        if (!single_op.containsElementNamed("field")) {
+            Rcpp::stop("missied 'field' value which is a mandatory option for update operation description.");
+        }
+
+        auto field_no = Rcpp::as<uint32_t>(single_op["field"]);
+
+        if (!single_op.containsElementNamed("op")) {
+            Rcpp::stop("missied 'op' value which is a mandatory option for update operation description.");
+        }
+
+        auto op = single_op["op"];
+        auto op_type = TYPEOF(op);
+        if (op_type != STRSXP) {
+            Rcpp::stop("update operator must be a string value.");
+        }
+
+        auto s = Rcpp::as<std::string>(op);
+        if (s.size() != 1) {
+            Rcpp::stop("invalid update operator: %s", s.c_str());
+        }
+
+        auto op_value = s[0];
+
+        if (valid_update_operators.find(op_value) == valid_update_operators.end()) {
+            Rcpp::stop("invalid update operator: %c", op_value);
+        }
+
+        if (!single_op.containsElementNamed("arg")) {
+            Rcpp::stop("missied 'arg' value which is a mandatory option for update operation description.");
+        }
+
+        auto arg = single_op["arg"];
+        auto arg_type = TYPEOF(arg);
+
+        if (op_value == '+' || op_value == '-') {
+            if (arg_type == REALSXP) {
+                auto arg_value = Rcpp::as<double>(arg);
+                rc = beer_update_arith_double(ops.get(), field_no, op_value, arg_value);
+                check_beer_api_rc(rc, "beer_update_arith_double()");
+            } else if (arg_type == INTSXP) {
+                auto arg_value = Rcpp::as<int64_t>(arg);
+                rc = beer_update_arith_int(ops.get(), field_no, op_value, arg_value);
+                check_beer_api_rc(rc, "beer_update_arith_int()");
+            } else {
+                Rcpp::stop("invalid data type for this type of argument");
+            }
+        } else if (op_value == '&' || op_value == '|' || op_value == '^') {
+            if (arg_type == INTSXP) {
+                auto arg_value = Rcpp::as<int64_t>(arg);
+                if (arg_value < 0) {
+                    Rcpp::stop("bit operator requires argument to be non negative integer");
+                }
+                rc = beer_update_bit(ops.get(), field_no, op_value, arg_value);
+                check_beer_api_rc(rc, "beer_update_bit()");
+            } else {
+                Rcpp::stop("invalid operator for this type of argument");
+            }
+        } else if (op_value == '=') {
+            TntStreamPtr arg_value = pack_update_arg(arg);
+            rc = beer_update_assign(ops.get(), field_no, arg_value.get());
+            check_beer_api_rc(rc, "beer_update_assign()");
+        } else if (op_value == '#') {
+            if (arg_type == INTSXP || arg_type == REALSXP) {
+                auto arg_value = Rcpp::as<int64_t>(arg);
+                if (arg_value < 0) {
+                    Rcpp::stop("argument for delete operator must be non negative integer");
+                }
+                rc = beer_update_delete(ops.get(), field_no, arg_value);
+                check_beer_api_rc(rc, "beer_update_delete()");
+            } else {
+                Rcpp::stop("invalid operator for this type of argument");
+            }
+        } else if (op_value == '!') {
+            TntStreamPtr arg_value = pack_update_arg(arg);
+            rc = beer_update_insert(ops.get(), field_no, arg_value.get());
+            check_beer_api_rc(rc, "beer_update_insert()");
+        } else {
+            Rcpp::stop("unknown operator: %c", op_value);
+        }
+    }
+
+    rc = beer_update_container_close(ops.get());
+    check_beer_api_rc(rc, "beer_update_container_close()");
+
+    return (ops);
+}
+
+void Bee::check_beer_api_rc(int rc, const char *function_name)
+{
+    if (rc == -1) {
+        Rcpp::stop("'%s' function failed.", function_name);
+    }
+}
+
+TntStreamPtr Bee::pack_buffer(SEXP e)
+{
+    Rcpp::List data;
+
+    auto key_type = TYPEOF(e);
+    if (key_type == VECSXP) {
+        data = Rcpp::as<Rcpp::List>(e);
+    } else if (key_type == NILSXP) {
+        data = Rcpp::List::create();
+    } else {
+        data = Rcpp::List::create(e);
+    }
+
+    buff.clear();
+    msgpack::packer<msgpack::sbuffer> pk(&buff);
+
+    pack_list(data, pk);
+
+    return (TntStreamPtr(beer_object_as(NULL, const_cast<char *>(buff.data()), buff.size())));
+}
+
+TntStreamPtr Bee::pack_update_arg(SEXP e)
+{
+    update_op_buff.clear();
+    msgpack::packer<msgpack::sbuffer> pk(&update_op_buff);
+
+    Rcpp::List data;
+
+    auto key_type = TYPEOF(e);
+    if (key_type == VECSXP) {
+        data = Rcpp::as<Rcpp::List>(e);
+        pack_list(data, pk);
+    } else {
+        data = Rcpp::List::create(e);
+        auto it = data.begin();
+        pack_elem(it, pk);
+    }
+
+    return (TntStreamPtr(beer_object_as(NULL, const_cast<char *>(update_op_buff.data()), update_op_buff.size())));
+}
+
+std::string Bee::sexp_type_name(SEXP x)
+{
+    switch (TYPEOF(x)) {
+    case NILSXP:
+        return "NILSXP";
+    case SYMSXP:
+        return "SYMSXP";
+    case LISTSXP:
+        return "LISTSXP";
+    case CLOSXP:
+        return "CLOSXP";
+    case ENVSXP:
+        return "ENVSXP";
+    case PROMSXP:
+        return "PROMSXP";
+    case LANGSXP:
+        return "LANGSXP";
+    case SPECIALSXP:
+        return "SPECIALSXP";
+    case BUILTINSXP:
+        return "BUILTINSXP";
+    case CHARSXP:
+        return "CHARSXP";
+    case LGLSXP:
+        return "LGLSXP";
+    case INTSXP:
+        return "INTSXP";
+    case REALSXP:
+        return "REALSXP";
+    case CPLXSXP:
+        return "CPLXSXP";
+    case STRSXP:
+        return "STRSXP";
+    case DOTSXP:
+        return "DOTSXP";
+    case ANYSXP:
+        return "ANYSXP";
+    case VECSXP:
+        return "VECSXP";
+    case EXPRSXP:
+        return "EXPRSXP";
+    case BCODESXP:
+        return "BCODESXP";
+    case EXTPTRSXP:
+        return "EXTPTRSXP";
+    case WEAKREFSXP:
+        return "WEAKREFSXP";
+    case S4SXP:
+        return "S4SXP";
+    case RAWSXP:
+        return "RAWSXP";
+    default:
+        return "<unknown>";
+    }
+}
+
+std::string Bee::msgpack_type_name(int type)
+{
+    switch (type) {
+    case msgpack::type::NIL:
+        return "NIL";
+    case msgpack::type::BOOLEAN:
+        return "BOOLEAN";
+    case msgpack::type::POSITIVE_INTEGER:
+        return "POSITIVE_INTEGER";
+    case msgpack::type::NEGATIVE_INTEGER:
+        return "NEGATIVE_INTEGER";
+    case msgpack::type::FLOAT:
+        return "FLOAT";
+    case msgpack::type::STR:
+        return "STR";
+    case msgpack::type::BIN:
+        return "BIN";
+    case msgpack::type::ARRAY:
+        return "ARRAY";
+    case msgpack::type::MAP:
+        return "MAP";
+    case msgpack::type::EXT:
+        return "EXT";
+    default:
+        return "<unknown>";
+    }
+}
+
+RCPP_MODULE(Bee)
+{
+    Rcpp::class_<Bee>("Bee")
+        .constructor("default constructor")
+        .constructor<std::string, int>("constructor with host and port")
+        .constructor<std::string, int, std::string, std::string>("constructor with host, port user and password")
+        .method("ping", &Bee::ping, "runs 'PING' command to test server state")
+        .method("insert", &Bee::insert, "inserts data")
+        .method("replace", &Bee::replace, "replaces data")
+        .method("select", &Bee::select, "selects data")
+        .method("delete", &Bee::delete_, "deletes data")
+        .method("update", &Bee::update, "selects data")
+        .method("upsert", &Bee::upsert, "upserts data")
+        .method("call", &Bee::call, "call lua function")
+        .method("evaluate", &Bee::evaluate, "evaluate lua statement");
+}
+
+// [[Rcpp::export]]
+void exportBeeConstants()
+{
+    Rcpp::Environment env = Rcpp::Environment::global_env();
+
+    env["BEER_ITER_EQ"] = static_cast<int>(BEER_ITER_EQ);
+    env["BEER_ITER_REQ"] = static_cast<int>(BEER_ITER_REQ);
+    env["BEER_ITER_ALL"] = static_cast<int>(BEER_ITER_ALL);
+    env["BEER_ITER_LT"] = static_cast<int>(BEER_ITER_LT);
+    env["BEER_ITER_LE"] = static_cast<int>(BEER_ITER_LE);
+    env["BEER_ITER_GE"] = static_cast<int>(BEER_ITER_GE);
+    env["BEER_ITER_GT"] = static_cast<int>(BEER_ITER_GT);
+    env["BEER_ITER_BITS_ALL_SET"] = static_cast<int>(BEER_ITER_BITS_ALL_SET);
+    env["BEER_ITER_BITS_ANY_SET"] = static_cast<int>(BEER_ITER_BITS_ANY_SET);
+    env["BEER_ITER_BITS_ALL_NOT_SET"] = static_cast<int>(BEER_ITER_BITS_ALL_NOT_SET);
+    env["BEER_ITER_OVERLAP"] = static_cast<int>(BEER_ITER_OVERLAP);
+    env["BEER_ITER_NEIGHBOR"] = static_cast<int>(BEER_ITER_NEIGHBOR);
+}

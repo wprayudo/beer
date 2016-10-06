@@ -1,0 +1,21 @@
+Package: beer
+Type: Package
+Title: Bee Database Client
+Version: 0.1.0
+Author: Konstantin Sorokin
+Maintainer: Konstantin Sorokin <kvs@sigterm.ru>
+Description: R interface to Bee database.
+SystemRequirements: C++11
+License: GPL (>= 2)
+URL: https://github.com/wprayudo/beer
+BugReports: https://github.com/wprayudo/beer/issues
+LazyData: TRUE
+LinkingTo: Rcpp
+Depends:
+    Rcpp (>= 0.12.4)
+Suggests:
+    testthat,
+    RApiSerialize
+Imports:
+    methods,
+    Rcpp (>= 0.12.4)
