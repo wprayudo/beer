@@ -1,5 +1,5 @@
 ## Beer [![Build Status](https://travis-ci.org/wprayudo/beer.svg?branch=master)](https://travis-ci.org/wprayudo/beer)
-R driver for [Bee](https://github.com/wprayudo/bee) 1.4+ in-memory database and application server.
+R driver for [Bee](https://github.com/wprayudo/bee) 1.4+ engine.
 
 ## Install
 As for now `beer` package can only be installed directly from GitHub using `devtools` package.
